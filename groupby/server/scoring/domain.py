@@ -4,7 +4,7 @@
     점수         = 70 × 자격 충족률 + 30 × 우대 충족률
                    우대사항이 없는 공고는 100 × 자격 충족률
 
-이유는 08_algorithm/algorithm.md 4.2에 있다.
+이유는 03_prd/prd.md 10.2에 있다.
 """
 from dataclasses import dataclass, field
 from fractions import Fraction
