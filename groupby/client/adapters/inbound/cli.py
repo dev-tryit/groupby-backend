@@ -32,23 +32,26 @@ def main() -> None:
     collect_posting = CollectPosting(SaraminHttpSite(), FileCollectedStore(args.data / "postings"))
     read_posting = ReadPosting(
         images=FilePostingImageSource(args.data / "postings"),
-        reader=OpenAIVisionReader(os.environ["OPENAI_API_KEY"]),
+        reader=OpenAIVisionReader(os.environ.get("OPENAI_API_KEY", "")),
         store=FileReadingStore(args.data / "readings"),
     )
     submitter = FileSubmitter(args.outbox)
 
     for url_or_id in args.postings:
-        posting = collect_posting(url_or_id)
-        reading = read_posting(posting.posting_id)
-        path = submitter.submit(Submission(posting.posting_id, posting.title, reading.text))
-        input_tokens = sum(s.input_tokens for s in reading.slices)
-        output_tokens = sum(s.output_tokens for s in reading.slices)
-        cost = (input_tokens * INPUT_PRICE + output_tokens * OUTPUT_PRICE) / 1_000_000
-        print(f"{posting.posting_id} {posting.title}")
-        print(f"  수집: 이미지 {len(posting.images)}장")
-        print(f"  읽기: 조각 {len(reading.slices)}개, {len(reading.text)}자, 약 ${cost:.4f}")
-        print(f"  넘김: {path}")
-
+        try:
+            posting = collect_posting(url_or_id)
+            reading = read_posting(posting.posting_id)
+            path = submitter.submit(Submission(posting.posting_id, posting.title, reading.text))
+            input_tokens = sum(s.input_tokens for s in reading.slices)
+            output_tokens = sum(s.output_tokens for s in reading.slices)
+            cost = (input_tokens * INPUT_PRICE + output_tokens * OUTPUT_PRICE) / 1_000_000
+            print(f"{posting.posting_id} {posting.title}")
+            print(f"  수집: 이미지 {len(posting.images)}장")
+            print(f"  읽기: 조각 {len(reading.slices)}개, {len(reading.text)}자, 약 ${cost:.4f}")
+            print(f"  넘김: {path}")
+        except Exception as e:
+            # 공고 하나가 실패해도 다음 공고로 넘어간다 (07_api/background 2장).
+            print(f"{url_or_id} 실패: {type(e).__name__}")
 
 if __name__ == "__main__":
     main()

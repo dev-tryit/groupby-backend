@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 
 from groupby.server.adapters.outbound.file_feature_store import FileFeatureStore
+from groupby.server.adapters.inbound.http import serve
 from groupby.server.adapters.outbound.file_match_store import FileMatchStore
+from groupby.server.adapters.outbound.file_posting_catalog import FilePostingCatalog
 from groupby.server.adapters.outbound.file_resume_source import FileResumeSource
 from groupby.server.adapters.outbound.file_submission_source import FileSubmissionSource
 from groupby.server.adapters.outbound.openai_feature_extractor import OpenAIFeatureExtractor
@@ -15,7 +17,9 @@ from groupby.server.extraction.service import ExtractFeatures
 from groupby.server.matching.domain import ResumeMatch
 from groupby.server.matching.service import MatchResume
 from groupby.server.scoring.domain import Ranked, rank, score_resume
+from groupby.server.viewing.service import ViewResults
 from groupby.shared.env import load_env
+from groupby.shared.log import log, new_trace_id
 
 # gpt-4.1-mini의 가격. 토큰 100만 개당 달러 (02_research/ocr/ocr.md 2.3).
 INPUT_PRICE, OUTPUT_PRICE = 0.40, 1.60
@@ -94,6 +98,30 @@ def result_json(features: PostingFeatures, ranking: list[Ranked], matches: dict[
     }
 
 
+def match_postings(posting_ids: list[str], extract_features, match_resume, resumes) -> None:
+    """넘겨받은 공고마다 특징 추출과 비교를 한다. 저장된 것이 있으면 LLM을 부르지 않는다. 하나가 실패해도 다음으로 넘어간다."""
+    run_id = new_trace_id()
+    log("server", run_id, "run.started", postings=len(posting_ids))
+    done = failed = 0
+    for posting_id in posting_ids:
+        trace_id = new_trace_id()
+        try:
+            features = extract_features(posting_id)
+        except Exception as e:
+            failed += 1
+            log("server", trace_id, "llm.failed", "ERROR", posting_id=posting_id, purpose="extract", error=type(e).__name__)
+            continue
+        for resume in resumes.of_posting(posting_id):
+            try:
+                match_resume(features, resume)
+                done += 1
+                log("server", trace_id, "resume.matched", posting_id=posting_id, resume_id=resume.resume_id)
+            except Exception as e:
+                failed += 1
+                log("server", trace_id, "llm.failed", "ERROR", posting_id=posting_id, resume_id=resume.resume_id, purpose="match", error=type(e).__name__)
+    log("server", run_id, "run.finished", succeeded=done, failed=failed)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="groupby-server", description="서비스 제공사의 프로그램")
     parser.add_argument("--env", type=Path, default=Path(".env"))
@@ -105,21 +133,36 @@ def main() -> None:
     ranker = commands.add_parser("rank", help="이력서들을 조건과 비교해 점수와 랭킹과 근거를 낸다")
     ranker.add_argument("posting_ids", nargs="*", help="공고 번호. 비우면 넘겨받은 것 전부")
     ranker.add_argument("--resumes", type=Path, required=True, help="공고 번호별 이력서 폴더가 있는 폴더")
+    server = commands.add_parser("serve", help="넘겨받은 공고를 비교한 뒤 화면과 API를 연다")
+    server.add_argument("--resumes", type=Path, required=True, help="공고 번호별 이력서 폴더가 있는 폴더")
+    server.add_argument("--static", type=Path, default=None, help="화면의 정적 파일이 있는 폴더")
+    server.add_argument("--host", default="127.0.0.1")
+    server.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     load_env(args.env)
 
-    api_key = os.environ["OPENAI_API_KEY"]
+    # 키가 없어도 저장된 결과는 보여 준다. LLM을 불러야 하는 단계만 실패한다.
+    api_key = os.environ.get("OPENAI_API_KEY", "")
     submissions = FileSubmissionSource(args.inbox)
     extract_features = ExtractFeatures(submissions, OpenAIFeatureExtractor(api_key), FileFeatureStore(args.data / "features"))
-    posting_ids = args.posting_ids or submissions.posting_ids()
+    posting_ids = getattr(args, "posting_ids", None) or submissions.posting_ids()
 
     if args.command == "extract":
         for posting_id in posting_ids:
             print_features(extract_features(posting_id))
         return
 
-    match_resume = MatchResume(OpenAIMatcher(api_key), FileMatchStore(args.data / "matches"))
+    match_store = FileMatchStore(args.data / "matches")
+    match_resume = MatchResume(OpenAIMatcher(api_key), match_store)
     resumes = FileResumeSource(args.resumes)
+
+    if args.command == "serve":
+        match_postings(posting_ids, extract_features, match_resume, resumes)
+        catalog = FilePostingCatalog(args.data / "features", args.inbox)
+        view = ViewResults(catalog, FileFeatureStore(args.data / "features"), match_store, resumes)
+        serve(view, args.static, args.host, args.port)
+        return
+
     spent = 0.0
     for posting_id in posting_ids:
         features = extract_features(posting_id)
