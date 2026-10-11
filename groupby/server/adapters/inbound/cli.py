@@ -1,17 +1,97 @@
-"""서비스 제공사 프로그램의 명령줄 진입점. 고객사가 넘긴 것 → 특징 추출."""
+"""서비스 제공사 프로그램의 명령줄 진입점. 고객사가 넘긴 것 → 특징 추출 → 비교 → 점수와 랭킹."""
 import argparse
+import json
 import os
 from pathlib import Path
 
 from groupby.server.adapters.outbound.file_feature_store import FileFeatureStore
+from groupby.server.adapters.outbound.file_match_store import FileMatchStore
+from groupby.server.adapters.outbound.file_resume_source import FileResumeSource
 from groupby.server.adapters.outbound.file_submission_source import FileSubmissionSource
 from groupby.server.adapters.outbound.openai_feature_extractor import OpenAIFeatureExtractor
-from groupby.server.extraction.domain import GROUPS
+from groupby.server.adapters.outbound.openai_matcher import OpenAIMatcher
+from groupby.server.extraction.domain import CONDITION_GROUPS, GROUPS, PostingFeatures
 from groupby.server.extraction.service import ExtractFeatures
+from groupby.server.matching.domain import ResumeMatch
+from groupby.server.matching.service import MatchResume
+from groupby.server.scoring.domain import Ranked, rank, score_resume
 from groupby.shared.env import load_env
 
 # gpt-4.1-mini의 가격. 토큰 100만 개당 달러 (02_research/ocr/ocr.md 2.3).
 INPUT_PRICE, OUTPUT_PRICE = 0.40, 1.60
+
+
+def cost_of(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * INPUT_PRICE + output_tokens * OUTPUT_PRICE) / 1_000_000
+
+
+def print_features(result: PostingFeatures) -> None:
+    print(f"{result.posting_id} 직무: {result.job}")
+    for group in GROUPS:
+        print(f"  {group}")
+        for item in result.of(group):
+            mark = "" if item.in_reading else "  ← 읽은 내용에 없음"
+            print(f"    {item.id} {item.text}{mark}")
+
+
+def mark_of(match: ResumeMatch, condition_id: str) -> tuple[str, str]:
+    """화면에 보여 줄 판정과 근거."""
+    judgment = match.of(condition_id)
+    if judgment is None:
+        return "다름", "판정을 받지 못함"
+    if judgment.unverified:
+        return "다름", f"근거를 확인하지 못함 (모델의 판정: {judgment.verdict})"
+    if judgment.not_written:
+        return "다름", "이력서에 적혀 있지 않음"
+    return judgment.verdict, " / ".join(f"\"{q}\"" for q in judgment.quotes)
+
+
+def print_ranking(features: PostingFeatures, ranking: list[Ranked], matches: dict[str, ResumeMatch]) -> None:
+    print(f"\n=== {features.posting_id} {features.job} 랭킹 ===")
+    for entry in ranking:
+        s = entry.score
+        preferred = f", 우대사항 {s.preferred.matched}/{s.preferred.count}" if s.preferred.count else ""
+        print(f"{entry.rank}위  {s.rounded:>3}점  {s.resume_id}  (자격요건 {s.required.matched}/{s.required.count} 일치{preferred})")
+    for entry in ranking:
+        s = entry.score
+        match = matches[s.resume_id]
+        print(f"\n[{s.resume_id}] {s.rounded}점")
+        for group in CONDITION_GROUPS:
+            for item in features.of(group):
+                verdict, evidence = mark_of(match, item.id)
+                points = f"{s.points_by_condition[item.id]}점" if item.id in s.points_by_condition else "점수 없음"
+                print(f"  {item.id} [{group}] {item.text}")
+                print(f"      {verdict} ({points}) · 근거: {evidence}")
+
+
+def result_json(features: PostingFeatures, ranking: list[Ranked], matches: dict[str, ResumeMatch]) -> dict:
+    return {
+        "posting_id": features.posting_id,
+        "job": features.job,
+        "items": [{"id": i.id, "group": i.group, "text": i.text} for i in features.items],
+        "ranking": [
+            {
+                "rank": entry.rank,
+                "resume_id": entry.score.resume_id,
+                "score": entry.score.rounded,
+                "required": f"{entry.score.required.points}/{entry.score.required.full}",
+                "preferred": f"{entry.score.preferred.points}/{entry.score.preferred.full}",
+                "judgments": [
+                    {
+                        "condition_id": item.id,
+                        "group": item.group,
+                        "verdict": mark_of(matches[entry.score.resume_id], item.id)[0],
+                        "evidence": mark_of(matches[entry.score.resume_id], item.id)[1],
+                        "thinking": getattr(matches[entry.score.resume_id].of(item.id), "thinking", ""),
+                        "points": entry.score.points_by_condition.get(item.id),
+                    }
+                    for group in CONDITION_GROUPS
+                    for item in features.of(group)
+                ],
+            }
+            for entry in ranking
+        ],
+    }
 
 
 def main() -> None:
@@ -22,24 +102,35 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     extract = commands.add_parser("extract", help="넘겨받은 제목과 읽은 내용에서 직무와 그 직무의 특징을 뽑는다")
     extract.add_argument("posting_ids", nargs="*", help="공고 번호. 비우면 넘겨받은 것 전부")
+    ranker = commands.add_parser("rank", help="이력서들을 조건과 비교해 점수와 랭킹과 근거를 낸다")
+    ranker.add_argument("posting_ids", nargs="*", help="공고 번호. 비우면 넘겨받은 것 전부")
+    ranker.add_argument("--resumes", type=Path, required=True, help="공고 번호별 이력서 폴더가 있는 폴더")
     args = parser.parse_args()
     load_env(args.env)
 
+    api_key = os.environ["OPENAI_API_KEY"]
     submissions = FileSubmissionSource(args.inbox)
-    extract_features = ExtractFeatures(
-        submissions=submissions,
-        extractor=OpenAIFeatureExtractor(os.environ["OPENAI_API_KEY"]),
-        store=FileFeatureStore(args.data / "features"),
-    )
-    for posting_id in args.posting_ids or submissions.posting_ids():
-        result = extract_features(posting_id)
-        cost = (result.input_tokens * INPUT_PRICE + result.output_tokens * OUTPUT_PRICE) / 1_000_000
-        print(f"{result.posting_id} 직무: {result.job} (약 ${cost:.4f})")
-        for group in GROUPS:
-            print(f"  {group}")
-            for item in result.of(group):
-                mark = "" if item.in_reading else "  ← 읽은 내용에 없음"
-                print(f"    {item.id} {item.text}{mark}")
+    extract_features = ExtractFeatures(submissions, OpenAIFeatureExtractor(api_key), FileFeatureStore(args.data / "features"))
+    posting_ids = args.posting_ids or submissions.posting_ids()
+
+    if args.command == "extract":
+        for posting_id in posting_ids:
+            print_features(extract_features(posting_id))
+        return
+
+    match_resume = MatchResume(OpenAIMatcher(api_key), FileMatchStore(args.data / "matches"))
+    resumes = FileResumeSource(args.resumes)
+    spent = 0.0
+    for posting_id in posting_ids:
+        features = extract_features(posting_id)
+        matches = {r.resume_id: match_resume(features, r) for r in resumes.of_posting(posting_id)}
+        ranking = rank([score_resume(features, m) for m in matches.values()])
+        print_ranking(features, ranking, matches)
+        out = args.data / "results" / f"{posting_id}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result_json(features, ranking, matches), ensure_ascii=False, indent=2), encoding="utf-8")
+        spent += sum(cost_of(m.input_tokens, m.output_tokens) for m in matches.values())
+    print(f"\n비교에 쓴 토큰의 비용: 약 ${spent:.4f} (저장된 결과를 다시 쓴 경우에도 처음 만들 때의 비용이다)")
 
 
 if __name__ == "__main__":
