@@ -5,6 +5,9 @@ import secrets
 import sys
 from datetime import datetime
 
+# gpt-4.1-mini의 가격. 토큰 100만 개당 달러 (02_research/ocr/ocr.md 2.3).
+INPUT_PRICE, OUTPUT_PRICE = 0.40, 1.60
+
 TRACE_ID = re.compile(r"[0-9a-f]{8}")
 
 
@@ -14,6 +17,10 @@ def new_trace_id() -> str:
 
 def trace_id_or_new(value: str | None) -> str:
     return value if value and TRACE_ID.fullmatch(value) else new_trace_id()
+
+
+def cost_usd(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * INPUT_PRICE + output_tokens * OUTPUT_PRICE) / 1_000_000
 
 
 def log(service: str, trace_id: str, event: str, level: str = "INFO", **fields) -> None:

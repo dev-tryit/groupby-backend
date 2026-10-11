@@ -18,6 +18,7 @@ class OpenAIVisionReader:
     def __init__(self, api_key: str, model: str = "gpt-4.1-mini"):
         self._api_key = api_key
         self.model = model
+        self.last_request_id: str | None = None  # OpenAI가 응답에 준 요청 번호. 로그에 남긴다
 
     def read(self, image: Image.Image) -> tuple[str, int, int]:
         buffer = io.BytesIO()
@@ -43,6 +44,7 @@ class OpenAIVisionReader:
         )
         with urllib.request.urlopen(request, timeout=120) as response:
             result = json.load(response)
+            self.last_request_id = response.headers.get("x-request-id")
         usage = result["usage"]
         text = result["choices"][0]["message"]["content"] or ""
         return text.strip(), usage["prompt_tokens"], usage["completion_tokens"]

@@ -1,5 +1,6 @@
 """특징 추출의 도메인. 직무와 그 직무의 담당업무, 자격요건, 우대사항, 참고사항."""
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 # 직무에서 뽑는 네 가지. 자격요건과 우대사항은 점수에 넣는다.
@@ -52,8 +53,8 @@ def settle_group(kind: str, group: str) -> str:
 
 
 def squeeze(text: str) -> str:
-    """띄어쓰기와 줄바꿈의 차이를 지운다. 글자가 같은지만 본다."""
-    return re.sub(r"\s+", "", text)
+    """띄어쓰기와 줄바꿈, 유니코드의 표기 차이(눈으로 같은 글자의 다른 코드)를 지운다. 글자가 같은지만 본다."""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
 
 
 def mark_in_reading(items: list[Item], reading_text: str) -> None:

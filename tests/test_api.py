@@ -8,7 +8,7 @@ from groupby.server.adapters.inbound.http import BadRequest, answer
 from groupby.server.extraction.domain import Item, PostingFeatures
 from groupby.server.matching.domain import DIFFERENT, MATCH, SIMILAR, Judgment, ResumeMatch
 from groupby.server.matching.ports import Resume
-from groupby.server.viewing.service import NOT_WRITTEN, UNVERIFIED, NotFound, ViewResults
+from groupby.server.viewing.service import NOT_WRITTEN, UNVERIFIED, NotFound, ViewResults, masked_name
 
 FEATURES = PostingFeatures(
     "100",
@@ -36,11 +36,16 @@ MATCHES = {
 
 
 class Stored:
+    text = "회계 경력사원 모집\n경력 3년"
+
     def posting_ids(self):
         return ["100"]
 
     def title_of(self, posting_id):
         return "회계 경력사원 모집"
+
+    def text_of(self, posting_id):
+        return self.text
 
     def load(self, posting_id, resume_id=None):
         return FEATURES if resume_id is None else MATCHES.get(resume_id)
@@ -65,6 +70,25 @@ class Posting(unittest.TestCase):
     def test_resume_without_stored_match_is_not_ranked(self):
         self.assertNotIn("100-not-matched-yet", [r["resume_id"] for r in self.posting["ranking"]])
 
+    def test_posting_carries_the_submitted_text(self):
+        self.assertEqual(self.posting["text"], "회계 경력사원 모집\n경력 3년")
+
+    def test_in_reading_is_computed_from_the_submitted_text(self):
+        """저장해 둔 값이 아니라 지금 넘겨받은 읽은 내용으로 본다. C3은 저장된 값이 거짓이지만 읽은 내용에 있다."""
+        stored = Stored()
+        stored.text = "경력 3년\n군필"
+        conditions = ViewResults(stored, stored, stored, stored).posting("100")["conditions"]
+        found = {c["no"]: c["in_reading"] for cs in conditions.values() for c in cs}
+        self.assertEqual(found, {"C1": True, "C2": False, "C3": True})
+
+    def test_posting_without_a_submission_has_no_text(self):
+        """수집이 실패한 실행이다. 조건과 랭킹은 나오고 공고 원문은 없다."""
+        stored = Stored()
+        stored.text = None
+        posting = ViewResults(stored, stored, stored, stored).posting("100")
+        self.assertIsNone(posting["text"])
+        self.assertEqual(len(posting["ranking"]), 3)
+
     def test_conditions_are_grouped_and_duties_are_separate(self):
         self.assertEqual([d["no"] for d in self.posting["duties"]], ["D1"])
         self.assertEqual({g: [c["no"] for c in cs] for g, cs in self.posting["conditions"].items()},
@@ -87,6 +111,23 @@ class ResumeMatchView(unittest.TestCase):
 
     def test_resume_text_comes_with_the_evidence(self):
         self.assertEqual(answer(view(), "/api/resumes/100-a")["resume_text"], "a의 이력서")
+
+
+class ApplicantName(unittest.TestCase):
+    """목록에는 이름 전체를 내보내지 않는다. 가운데를 가린다."""
+
+    def test_name_is_masked(self):
+        self.assertEqual(masked_name("# 이력서 — 강민재\n\n## 경력"), "강*재")
+        self.assertEqual(masked_name("# 성과 중심 이력서 — 남궁민수"), "남**수")
+        self.assertEqual(masked_name("# 이력서 - 이산"), "이*")
+
+    def test_resume_without_a_name_in_its_title_has_no_name(self):
+        """그때 화면은 이력서 번호를 보여 준다."""
+        self.assertIsNone(masked_name("경력 5년의 마케터입니다."))
+        self.assertIsNone(masked_name(""))
+
+    def test_ranking_carries_the_masked_name(self):
+        self.assertIsNone(answer(view(), "/api/postings/100")["ranking"][0]["name"])
 
 
 class Errors(unittest.TestCase):

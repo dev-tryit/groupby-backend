@@ -1,5 +1,6 @@
 """비교의 도메인. 판정의 모양과, 근거가 이력서 안에 있는지 확인하는 규칙."""
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 MATCH, SIMILAR, DIFFERENT = "일치", "비슷", "다름"
@@ -45,7 +46,7 @@ class ResumeMatch:
 
 def squeeze(text: str) -> str:
     """띄어쓰기, 줄바꿈, 글머리 기호(#, -, *)의 차이를 지운다. 글자가 같은지만 본다."""
-    return re.sub(r"[\s#*`\-]+", "", text)
+    return re.sub(r"[\s#*`\-]+", "", unicodedata.normalize("NFKC", text))
 
 
 def mark_quotes(judgments: list[Judgment], resume_text: str) -> None:

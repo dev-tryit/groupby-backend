@@ -13,6 +13,9 @@ class PostingCatalog(Protocol):
     def title_of(self, posting_id: str) -> str | None:
         """고객사가 넘긴 제목. 넘긴 것이 없으면 None."""
 
+    def text_of(self, posting_id: str) -> str | None:
+        """고객사가 넘긴, 공고를 읽은 내용. 넘긴 것이 없으면 None."""
+
 
 class FeatureReader(Protocol):
     def load(self, posting_id: str) -> PostingFeatures | None: ...

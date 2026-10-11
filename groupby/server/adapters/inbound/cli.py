@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 from groupby.server.adapters.outbound.file_feature_store import FileFeatureStore
@@ -12,22 +13,14 @@ from groupby.server.adapters.outbound.file_resume_source import FileResumeSource
 from groupby.server.adapters.outbound.file_submission_source import FileSubmissionSource
 from groupby.server.adapters.outbound.openai_feature_extractor import OpenAIFeatureExtractor
 from groupby.server.adapters.outbound.openai_matcher import OpenAIMatcher
-from groupby.server.extraction.domain import CONDITION_GROUPS, GROUPS, PostingFeatures
+from groupby.server.extraction.domain import CONDITION_GROUPS, GROUPS, PostingFeatures, mark_in_reading
 from groupby.server.extraction.service import ExtractFeatures
-from groupby.server.matching.domain import ResumeMatch
+from groupby.server.matching.domain import VERDICTS, ResumeMatch
 from groupby.server.matching.service import MatchResume
 from groupby.server.scoring.domain import Ranked, rank, score_resume
 from groupby.server.viewing.service import ViewResults
 from groupby.shared.env import load_env
-from groupby.shared.log import log, new_trace_id
-
-# gpt-4.1-mini의 가격. 토큰 100만 개당 달러 (02_research/ocr/ocr.md 2.3).
-INPUT_PRICE, OUTPUT_PRICE = 0.40, 1.60
-
-
-def cost_of(input_tokens: int, output_tokens: int) -> float:
-    return (input_tokens * INPUT_PRICE + output_tokens * OUTPUT_PRICE) / 1_000_000
-
+from groupby.shared.log import cost_usd, log, new_trace_id, trace_id_or_new
 
 def print_features(result: PostingFeatures) -> None:
     print(f"{result.posting_id} 직무: {result.job}")
@@ -98,28 +91,93 @@ def result_json(features: PostingFeatures, ranking: list[Ranked], matches: dict[
     }
 
 
-def match_postings(posting_ids: list[str], extract_features, match_resume, resumes) -> None:
-    """넘겨받은 공고마다 특징 추출과 비교를 한다. 저장된 것이 있으면 LLM을 부르지 않는다. 하나가 실패해도 다음으로 넘어간다."""
+def match_postings(posting_ids, submissions, feature_store, match_store, extract_features, match_resume, resumes, extractor, matcher) -> None:
+    """넘겨받은 공고마다 특징 추출과 비교를 하고, 한 일을 로그로 남긴다 (11_log/log.md).
+
+    저장된 것이 있으면 LLM을 부르지 않는다. 하나가 실패해도 다음으로 넘어간다.
+    로그에는 번호와 수만 남긴다. 이력서의 글자, 근거의 구절, 읽은 내용은 남기지 않는다.
+    """
     run_id = new_trace_id()
+    started = time.monotonic()
+    totals = {"done": 0, "failed": 0, "calls": 0, "cost": 0.0}
     log("server", run_id, "run.started", postings=len(posting_ids))
-    done = failed = 0
+
+    def called(emit, purpose: str, result, adapter, since: float, **fields) -> None:
+        cost = cost_usd(result.input_tokens, result.output_tokens)
+        totals["calls"] += 1
+        totals["cost"] += cost
+        emit(
+            "llm.called",
+            purpose=purpose,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cost_usd=round(cost, 4),
+            ms=int((time.monotonic() - since) * 1000),
+            openai_request_id=getattr(adapter, "last_request_id", None),
+            **fields,
+        )
+
     for posting_id in posting_ids:
-        trace_id = new_trace_id()
+        try:
+            submission = submissions.load(posting_id)
+        except Exception:
+            submission = None
+        # 고객사 프로그램이 넘긴 값을 이어 쓴다. 없으면(앞의 실행에서 넘긴 것) 하나 만든다.
+        trace_id = trace_id_or_new(submission.trace_id if submission else None)
+
+        def emit(event: str, level: str = "INFO", **fields) -> None:
+            log("server", trace_id, event, level, posting_id=posting_id, **fields)
+
+        stored = feature_store.load(posting_id) is not None
+        since = time.monotonic()
         try:
             features = extract_features(posting_id)
         except Exception as e:
-            failed += 1
-            log("server", trace_id, "llm.failed", "ERROR", posting_id=posting_id, purpose="extract", error=type(e).__name__)
+            totals["failed"] += 1
+            emit("llm.failed", "ERROR", purpose="extract", error=type(e).__name__)
             continue
+        if stored:
+            emit("stage.skipped", stage="extract")
+        else:
+            called(emit, "extract", features, extractor, since)
+            emit("features.extracted", groups={group: len(features.of(group)) for group in GROUPS})
+        if submission:
+            mark_in_reading(features.items, submission.text)
+        for item in features.items:
+            if not item.in_reading:
+                emit("item.not_in_reading", "WARN", item_id=f"{posting_id}-{item.id}")
+
         for resume in resumes.of_posting(posting_id):
+            stored = match_store.load(posting_id, resume.resume_id) is not None
+            since = time.monotonic()
             try:
-                match_resume(features, resume)
-                done += 1
-                log("server", trace_id, "resume.matched", posting_id=posting_id, resume_id=resume.resume_id)
+                match = match_resume(features, resume)
             except Exception as e:
-                failed += 1
-                log("server", trace_id, "llm.failed", "ERROR", posting_id=posting_id, resume_id=resume.resume_id, purpose="match", error=type(e).__name__)
-    log("server", run_id, "run.finished", succeeded=done, failed=failed)
+                totals["failed"] += 1
+                emit("llm.failed", "ERROR", resume_id=resume.resume_id, purpose="match", error=type(e).__name__)
+                continue
+            if stored:
+                emit("stage.skipped", resume_id=resume.resume_id, stage="match")
+            else:
+                called(emit, "match", match, matcher, since, resume_id=resume.resume_id)
+            for judgment in match.judgments:
+                if judgment.quotes and not judgment.quotes_in_resume:
+                    emit("quote.not_in_resume", "WARN", resume_id=resume.resume_id, item_id=f"{posting_id}-{judgment.condition_id}", verdict=judgment.verdict)
+            verdicts = {verdict: sum(j.trusted_verdict == verdict for j in match.judgments) for verdict in VERDICTS}
+            emit("resume.matched", resume_id=resume.resume_id, verdicts=verdicts)
+            totals["done"] += 1
+
+    log(
+        "server",
+        run_id,
+        "run.finished",
+        succeeded=totals["done"],
+        failed=totals["failed"],
+        llm_calls=totals["calls"],
+        cost_usd=round(totals["cost"], 4),
+        ms=int((time.monotonic() - started) * 1000),
+    )
 
 
 def main() -> None:
@@ -144,7 +202,9 @@ def main() -> None:
     # 키가 없어도 저장된 결과는 보여 준다. LLM을 불러야 하는 단계만 실패한다.
     api_key = os.environ.get("OPENAI_API_KEY", "")
     submissions = FileSubmissionSource(args.inbox)
-    extract_features = ExtractFeatures(submissions, OpenAIFeatureExtractor(api_key), FileFeatureStore(args.data / "features"))
+    extractor = OpenAIFeatureExtractor(api_key)
+    feature_store = FileFeatureStore(args.data / "features")
+    extract_features = ExtractFeatures(submissions, extractor, feature_store)
     posting_ids = getattr(args, "posting_ids", None) or submissions.posting_ids()
 
     if args.command == "extract":
@@ -153,13 +213,14 @@ def main() -> None:
         return
 
     match_store = FileMatchStore(args.data / "matches")
-    match_resume = MatchResume(OpenAIMatcher(api_key), match_store)
+    matcher = OpenAIMatcher(api_key)
+    match_resume = MatchResume(matcher, match_store)
     resumes = FileResumeSource(args.resumes)
 
     if args.command == "serve":
-        match_postings(posting_ids, extract_features, match_resume, resumes)
+        match_postings(posting_ids, submissions, feature_store, match_store, extract_features, match_resume, resumes, extractor, matcher)
         catalog = FilePostingCatalog(args.data / "features", args.inbox)
-        view = ViewResults(catalog, FileFeatureStore(args.data / "features"), match_store, resumes)
+        view = ViewResults(catalog, feature_store, match_store, resumes)
         serve(view, args.static, args.host, args.port)
         return
 
@@ -172,7 +233,7 @@ def main() -> None:
         out = args.data / "results" / f"{posting_id}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result_json(features, ranking, matches), ensure_ascii=False, indent=2), encoding="utf-8")
-        spent += sum(cost_of(m.input_tokens, m.output_tokens) for m in matches.values())
+        spent += sum(cost_usd(m.input_tokens, m.output_tokens) for m in matches.values())
     print(f"\n비교에 쓴 토큰의 비용: 약 ${spent:.4f} (저장된 결과를 다시 쓴 경우에도 처음 만들 때의 비용이다)")
 
 

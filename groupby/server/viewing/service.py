@@ -2,7 +2,9 @@
 
 LLM을 부르지 않는다. 점수와 순위는 저장하지 않고 물을 때마다 계산한다.
 """
-from groupby.server.extraction.domain import CONDITION_GROUPS, DUTY, SCORED_GROUPS, Item, PostingFeatures
+import re
+
+from groupby.server.extraction.domain import CONDITION_GROUPS, DUTY, SCORED_GROUPS, Item, PostingFeatures, mark_in_reading
 from groupby.server.matching.domain import ResumeMatch
 from groupby.server.matching.ports import Resume
 from groupby.server.scoring.domain import GroupScore, Score, rank, score_resume
@@ -11,6 +13,26 @@ from .ports import FeatureReader, MatchReader, PostingCatalog, ResumeReader
 
 NOT_WRITTEN = "이력서에 적혀 있지 않음"
 UNVERIFIED = "근거를 확인하지 못함"
+
+
+TITLE_NAME = re.compile(r"^#[^\n]*[—–-]\s*(\S[^\n]*?)\s*$")
+
+
+def masked_name(resume_text: str) -> str | None:
+    """이력서 첫 줄의 제목에서 이름을 얻어 가운데를 가린다. 화면의 목록에는 이름 전체를 내보내지 않는다.
+
+    제목이 `# 이력서 — 이름`의 모양이 아니면 None이다. 그때 화면은 이력서 번호를 보여 준다.
+    """
+    lines = resume_text.strip().splitlines()
+    found = TITLE_NAME.match(lines[0]) if lines else None
+    if not found:
+        return None
+    name = found.group(1)
+    if len(name) <= 1:
+        return name
+    if len(name) == 2:
+        return name[0] + "*"
+    return name[0] + "*" * (len(name) - 2) + name[-1]
 
 
 class NotFound(Exception):
@@ -57,14 +79,20 @@ class ViewResults:
 
     def posting(self, posting_id: str) -> dict:
         features = self._load_features(posting_id)
+        text = self._catalog.text_of(posting_id)
+        if text:
+            # 넘겨받은 읽은 내용이 있으면 조건이 그 안에 있는지를 지금 다시 계산한다.
+            mark_in_reading(features.items, text)
         matched = self._matched(features)
         scores = {m.resume_id: score_resume(features, m) for _, m in matched}
+        names = {r.resume_id: masked_name(r.text) for r, _ in matched}
         by_id = {m.resume_id: m for _, m in matched}
         conditions = [item for group in CONDITION_GROUPS for item in features.of(group)]
         return {
             "posting_id": posting_id,
             "title": self._title(features),
             "job": features.job,
+            "text": text,
             "duties": [
                 {"item_id": item_key(posting_id, item), "no": item.id, "text": item.text}
                 for item in features.of(DUTY)
@@ -80,6 +108,7 @@ class ViewResults:
                 {
                     "rank": entry.rank,
                     "resume_id": resume_key(posting_id, entry.score.resume_id),
+                    "name": names[entry.score.resume_id],
                     **self._score_view(entry.score),
                     "verdicts": [
                         {"item_id": item_key(posting_id, item), "mark": mark_of(by_id[entry.score.resume_id], item)}
@@ -120,6 +149,7 @@ class ViewResults:
         return {
             "posting_id": features.posting_id,
             "resume_id": resume_key(features.posting_id, resume.resume_id),
+            "name": masked_name(resume.text),
             **self._score_view(score),
             "judgments": judgments,
             "resume_text": resume.text,

@@ -44,6 +44,7 @@ class OpenAIFeatureExtractor:
     def __init__(self, api_key: str, model: str = "gpt-4.1-mini"):
         self._api_key = api_key
         self.model = model
+        self.last_request_id: str | None = None  # OpenAI가 응답에 준 요청 번호. 로그에 남긴다
         self._prompt = PROMPT_PATH.read_text(encoding="utf-8")
 
     def extract(self, submission: Submission) -> PostingFeatures:
@@ -66,6 +67,7 @@ class OpenAIFeatureExtractor:
         )
         with urllib.request.urlopen(request, timeout=180) as response:
             result = json.load(response)
+            self.last_request_id = response.headers.get("x-request-id")
         data = json.loads(result["choices"][0]["message"]["content"])
         usage = result["usage"]
         return PostingFeatures(

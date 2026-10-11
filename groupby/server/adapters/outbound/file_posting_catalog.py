@@ -9,10 +9,15 @@ class FilePostingCatalog:
         self._inbox = inbox
 
     def posting_ids(self) -> list[str]:
-        return sorted(p.stem for p in self._features_root.glob("*.json"))
+        # 공고 번호가 큰 것(최근에 올라온 공고)이 먼저다.
+        return sorted((p.stem for p in self._features_root.glob("*.json")), key=int, reverse=True)
 
     def title_of(self, posting_id: str) -> str | None:
+        return self._submitted(posting_id).get("title")
+
+    def text_of(self, posting_id: str) -> str | None:
+        return self._submitted(posting_id).get("text")
+
+    def _submitted(self, posting_id: str) -> dict:
         path = self._inbox / f"{posting_id}.json"
-        if not path.exists():
-            return None
-        return json.loads(path.read_text(encoding="utf-8")).get("title")
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}

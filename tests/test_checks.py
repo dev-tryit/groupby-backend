@@ -25,6 +25,12 @@ class EvidenceInResume(unittest.TestCase):
     def test_spacing_and_bullet_marks_do_not_matter(self):
         self.assertFalse(self.check(["- 매출, 광고비,  ROAS 지표를 주 단위로 보았습니다."]).unverified)
 
+    def test_same_looking_character_in_another_code_is_accepted(self):
+        """읽을 때마다 'ㄴ'이 U+3134로도 U+1102로도 나온다. 눈으로 같은 글자는 같다고 본다."""
+        judgment = Judgment("C1", "", ["운영 \u1102 메타"], MATCH)
+        mark_quotes([judgment], "매체별 운영 \u3134 메타, 네이버")
+        self.assertTrue(judgment.quotes_in_resume)
+
     def test_one_changed_character_is_rejected(self):
         """'보았습니다'를 '봤습니다'로 바꿔 옮기면 믿지 않는다."""
         judgment = self.check(["매출, 광고비, ROAS 지표를 주 단위로 봤습니다."])

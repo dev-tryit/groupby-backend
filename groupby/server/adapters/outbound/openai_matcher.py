@@ -46,6 +46,7 @@ class OpenAIMatcher:
     def __init__(self, api_key: str, model: str = "gpt-4.1-mini", today: date | None = None):
         self._api_key = api_key
         self.model = model
+        self.last_request_id: str | None = None  # OpenAI가 응답에 준 요청 번호. 로그에 남긴다
         # "현재"까지의 기간을 셈하려면 오늘이 언제인지 알아야 한다. 모델은 오늘 날짜를 모른다.
         self._today = today or date.today()
         self._prompt = PROMPT_PATH.read_text(encoding="utf-8")
@@ -70,6 +71,7 @@ class OpenAIMatcher:
         )
         with urllib.request.urlopen(request, timeout=180) as response:
             result = json.load(response)
+            self.last_request_id = response.headers.get("x-request-id")
         data = json.loads(result["choices"][0]["message"]["content"])
         usage = result["usage"]
         return ResumeMatch(

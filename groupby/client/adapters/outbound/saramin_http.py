@@ -5,7 +5,9 @@
 import html
 import re
 import time
+import urllib.parse
 import urllib.request
+from typing import Callable
 
 from groupby.client.collecting.domain import CollectedImage, CollectedPosting, clean_title, is_body_image
 
@@ -16,20 +18,34 @@ PAUSE_SECONDS = 2
 
 
 class SaraminHttpSite:
-    def _get(self, url: str) -> tuple[bytes, str]:
+    def __init__(self, on_request: Callable[..., None] | None = None):
+        # 요청마다 대상의 호스트와 결과를 알린다. 주소 전체는 알리지 않는다.
+        self._on_request = on_request
+
+    def _get(self, url: str, purpose: str) -> tuple[bytes, str]:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        started = time.monotonic()
         with urllib.request.urlopen(request, timeout=60) as response:
             body = response.read()
             content_type = response.headers.get("Content-Type", "")
+            status = response.status
+        if self._on_request:
+            self._on_request(
+                host=urllib.parse.urlparse(url).hostname,
+                purpose=purpose,
+                status=status,
+                content_type=content_type,
+                ms=int((time.monotonic() - started) * 1000),
+            )
         time.sleep(PAUSE_SECONDS)
         return body, content_type
 
     def fetch(self, posting_id: str) -> CollectedPosting:
-        outer, _ = self._get(f"{BASE}/view?rec_idx={posting_id}")
+        outer, _ = self._get(f"{BASE}/view?rec_idx={posting_id}", "page")
         found = re.search(r"<title>(.*?)</title>", outer.decode("utf-8", errors="ignore"), re.S)
         title = clean_title(html.unescape(found.group(1))) if found else ""
 
-        detail, _ = self._get(f"{BASE}/view-detail?rec_idx={posting_id}&rec_seq=0")
+        detail, _ = self._get(f"{BASE}/view-detail?rec_idx={posting_id}&rec_seq=0", "page")
         sources = re.findall(r'<img[^>]*\ssrc="([^"]+)"', detail.decode("utf-8", errors="ignore"))
 
         posting = CollectedPosting(posting_id=posting_id, title=title)
@@ -37,7 +53,7 @@ class SaraminHttpSite:
             if not is_body_image(src):
                 continue
             url = "https:" + src if src.startswith("//") else src
-            content, content_type = self._get(url)
+            content, content_type = self._get(url, "image")
             # 거절할 때도 상태가 200으로 온다. 이미지인지는 Content-Type으로 확인한다.
             if not content_type.startswith("image/"):
                 raise RuntimeError(f"이미지가 아닌 응답을 받았다: {url} ({content_type})")
